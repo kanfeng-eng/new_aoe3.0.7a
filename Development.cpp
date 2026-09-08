@@ -216,11 +216,13 @@ int Development::get_addition_ResourceSort(int resourceSort)
     if (resourceSort == HUMAN_WOOD)  //对搬运wood加成
     {
         level = getActLevel(BUILDING_MARKET, BUILDING_MARKET_WOOD_UPGRADE);
-        switch (level) {
-        case 1:
+        if (level >= 1)
+        {
             addition += BUILDING_MARKET_WOOD_UPGRADE_ADDITION_CARRY;
-        default:
-            break;
+        }
+        if (level >= 2)
+        {
+            addition += BUILDING_MARKET_CRAFT_UPGRADE_ADDITION_CARRY;
         }
     }
     else if (resourceSort == HUMAN_STONE)    //对搬运stone加成
@@ -250,7 +252,13 @@ int Development::get_addition_ResourceSort(int resourceSort)
 
 Double Development::get_rate_ResorceGather(int resourceSort)
 {
-    int rate = 1;
+    Double rate(1);
+
+    // 采集速率配置使用整数百分比：20 表示 +20%。
+    auto addGatherRatePercent = [&rate](int percent)
+    {
+        rate += Double(percent) / Double(100);
+    };
 
     int level = 0;
     if (resourceSort == HUMAN_WOOD)  //对搬运wood加成
@@ -258,12 +266,12 @@ Double Development::get_rate_ResorceGather(int resourceSort)
         // 检查木材加工科技（工具时代）
         if (getActLevel(BUILDING_MARKET, BUILDING_MARKET_WOOD_UPGRADE) >= 1)
         {
-            rate += BUILDING_MARKET_WOOD_UPGRADE_ADDITION_GATHERRATE;
+            addGatherRatePercent(BUILDING_MARKET_WOOD_UPGRADE_ADDITION_GATHERRATE);
         }
         // 检查工艺科技（铜器时代，在木材加工基础上再增加）
         if (getActLevel(BUILDING_MARKET, BUILDING_MARKET_WOOD_UPGRADE) >= 2)
         {
-            rate += BUILDING_MARKET_CRAFT_UPGRADE_ADDITION_GATHERRATE;
+            addGatherRatePercent(BUILDING_MARKET_CRAFT_UPGRADE_ADDITION_GATHERRATE);
         }
     }
     else if (resourceSort == HUMAN_STONE)    //对搬运stone加成
@@ -271,7 +279,7 @@ Double Development::get_rate_ResorceGather(int resourceSort)
         level = getActLevel(BUILDING_MARKET, BUILDING_MARKET_STONE_UPGRADE);
         switch (level) {
         case 1:
-            rate += BUILDING_MARKET_STONE_UPGRADE_ADDITION_GATHERRATE;
+            addGatherRatePercent(BUILDING_MARKET_STONE_UPGRADE_ADDITION_GATHERRATE);
         default:
             break;
         }
@@ -281,7 +289,7 @@ Double Development::get_rate_ResorceGather(int resourceSort)
         level = getActLevel(BUILDING_MARKET, BUILDING_MARKET_GOLD_UPGRADE);
         switch (level) {
         case 1:
-            rate += BUILDING_MARKET_GOLD_UPGRADE_ADDITION_GATHERRATE;
+            addGatherRatePercent(BUILDING_MARKET_GOLD_UPGRADE_ADDITION_GATHERRATE);
         default:
             break;
         }
@@ -600,12 +608,12 @@ void Development::init_DevelopLab()
 
         //升级阔剑兵科技
         newNode = new conditionDevelop(CIVILIZATION_BRONZEAGE, BUILDING_ARMYCAMP, TIME_BUILDING_ARMYCAMP_UPGRADE_BROADSWORD,
-                                      0, BUILDING_ARMYCAMP_UPGRADE_BROADSWORD_FOOD, BUILDING_ARMYCAMP_UPGRADE_BROADSWORD_GOLD);
+                                      0, BUILDING_ARMYCAMP_UPGRADE_BROADSWORD_FOOD, 0, BUILDING_ARMYCAMP_UPGRADE_BROADSWORD_GOLD);
         developLab[BUILDING_ARMYCAMP].actCon[BUILDING_ARMYCAMP_UPGRADE_BROADSWORD].setHead(newNode);
 
         //训练阔剑兵（需要阔剑科技）
         newNode = new conditionDevelop(CIVILIZATION_BRONZEAGE, BUILDING_ARMYCAMP, TIME_BUILDING_ARMYCAMP_CREATE_BROADSWORD,
-                                      0, BUILDING_ARMYCAMP_CREATE_BROADSWORD_FOOD, BUILDING_ARMYCAMP_CREATE_BROADSWORD_GOLD);
+                                      0, BUILDING_ARMYCAMP_CREATE_BROADSWORD_FOOD, 0, BUILDING_ARMYCAMP_CREATE_BROADSWORD_GOLD);
         // 添加阔剑科技作为前置条件
         newNode->addPreCondition(developLab[BUILDING_ARMYCAMP].actCon[BUILDING_ARMYCAMP_UPGRADE_BROADSWORD].headAct);
         newNode->setCreatObjectAfterAction(SORT_ARMY, AT_BROADSWORDSMAN);
@@ -742,7 +750,7 @@ void Development::init_DevelopLab()
 
         //训练复合弓兵（需要复合弓科技）
         newNode = new conditionDevelop(CIVILIZATION_BRONZEAGE, BUILDING_RANGE, TIME_BUILDING_RANGE_CREATE_COMPOSITE_BOWMAN,
-                                      0, BUILDING_RANGE_CREATE_COMPOSITE_BOWMAN_FOOD, BUILDING_RANGE_CREATE_COMPOSITE_BOWMAN_GOLD);
+                                      0, BUILDING_RANGE_CREATE_COMPOSITE_BOWMAN_FOOD, 0, BUILDING_RANGE_CREATE_COMPOSITE_BOWMAN_GOLD);
         // 添加复合弓科技作为前置条件
         newNode->addPreCondition(developLab[BUILDING_RANGE].actCon[BUILDING_RANGE_UPGRADE_COMPOSITE_BOW].headAct);
         newNode->setCreatObjectAfterAction(SORT_ARMY, AT_COMPOSITE_BOWMAN);

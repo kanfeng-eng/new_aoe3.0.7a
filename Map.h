@@ -15,13 +15,19 @@ class Map
 public:
     Map();
     ~Map();
-    void init();
+    void init(QString mapPath="");
 
     // 重绘海岸
     void refineShore();
+    //重绘基础地形
+    void refineBaseTerrain();
     // 实时更新指定区域的海滩绘制
     void updateShoreArea(int centerL, int centerU, int radius = 2);
-    // 重置block为草地
+    //判断某一块土地是否是沙滩
+    __forceinline bool IsBeach(int x,int y){return (cell[x][y].Num >= 29 && cell[x][y].Num <= 40);}
+    //判断某一块土地是否是海洋
+    __forceinline bool IsOcean(int x,int y){  return cell[x][y].getMapType() == MAPTYPE_OCEAN;}
+    // 重置block为草地__forceinline bool Map::IsBeach(int x, int y)
     void resetBlockToGrass(int blockL, int blockU);
     // 检查block是否应该为海滩
     bool shouldBeBeach(int blockL, int blockU);
@@ -58,6 +64,11 @@ public:
     bool isFlat(int blockDR , int blockUR,int blockSideLen = 1);
     vector<pair<Point,int>> findBlock_Free(Coordinate* object , int disLen = 1 , bool mustFind = true);
     vector<Point>& findBlock_Free(Point blockPoint, int lenth,bool landUnit);
+
+    //判断指定格是否符合移动对象的地形类型；landUnit=true表示只能位于非海洋格
+    bool isTerrainValidForMove(const Point& block, bool landUnit);
+    //用于恢复已经位于错误地形中的对象；优先返回未被占用的最近合法格
+    Point findNearestValidTerrainBlock(const Point& start, bool landUnit);
 
     bool isOverBorder(int blockDR, int blockUR){ return blockDR<0 || blockDR>=MAP_L || blockUR<0 ||blockUR>=MAP_U; }
 
@@ -171,7 +182,7 @@ public:
     void InitFaultHandle();     // 初始化错误处理
     void InitCell(int Num, bool isExplored, bool isVisible);
     void ResetMapType(int blockL, int blockU);
-    void loadGenerateMapText();
+    void loadGenerateMapText(QString mapPath);
     
     // 应用敌人状态到MainWidget
     void applyEnemyStatusToMainWidget(class MainWidget* mainWidget);

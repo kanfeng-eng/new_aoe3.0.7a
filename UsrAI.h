@@ -16,16 +16,16 @@ public:
 
 private:
     void processData() override;
-    tagInfo getInfo(){return tagUsrGame.getInfo();}
     int AddToIns(instruction ins) override
-    {
-        UsrIns.lock.lock();
-        ins.id=UsrIns.g_id;
-        UsrIns.g_id++;
-        UsrIns.instructions.push(ins);
-        UsrIns.lock.unlock();
-        return ins.id;
-    }
+        {
+            UsrIns.lock.lock();
+            ins.id=UsrIns.g_id;
+            UsrIns.g_id++;
+            UsrIns.instructions.push(ins);
+            UsrIns.lock.unlock();
+            return ins.id;
+        }
+    tagInfo getInfo(){return tagUsrGame.getInfo();}
     void clearInsRet() override
     {
         tagUsrGame.clearInsRet();
@@ -36,10 +36,4 @@ private:
 
 };
 
-/*##########YOUR CODE BEGINS HERE##########*/
-
-
-
-
-/*##########YOUR CODE ENDS HERE##########*/
-#endif // USRAI_H
+#endif
