@@ -66,11 +66,13 @@ int findNearestResource(const tagInfo &info,
     return nearestSN;
 }
 
-// 按3:2:1的目标比例选择当前最缺人的任务。
-// 用“已有工人数 / 目标权重”比较，可以让新增的空闲村民逐渐补齐比例。
+// 按给定权重选择当前最缺人的任务。正常权重是3:2:1，资源不足时
+// 调用处会临时提高食物或木材权重。
 GatherKind chooseGatherKind(int foodWorkers,
                             int woodWorkers,
                             int stoneWorkers,
+                            int foodWeight,
+                            int woodWeight,
                             bool hasFood,
                             bool hasWood,
                             bool hasStone)
@@ -80,11 +82,13 @@ GatherKind chooseGatherKind(int foodWorkers,
 
     if (hasFood) {
         result = GATHER_FOOD;
-        bestLoad = foodWorkers / 3.0;
+        bestLoad = static_cast<double>(foodWorkers) / foodWeight;
     }
-    if (hasWood && (result == GATHER_NONE || woodWorkers / 2.0 < bestLoad)) {
+    if (hasWood &&
+        (result == GATHER_NONE ||
+         static_cast<double>(woodWorkers) / woodWeight < bestLoad)) {
         result = GATHER_WOOD;
-        bestLoad = woodWorkers / 2.0;
+        bestLoad = static_cast<double>(woodWorkers) / woodWeight;
     }
     if (hasStone && (result == GATHER_NONE || stoneWorkers < bestLoad))
         result = GATHER_STONE;
@@ -103,31 +107,52 @@ void UsrAI::processData()
     // processData可能在同一帧被多次调用。每隔10帧决策一次，既能及时响应，
     // 又能避免主线程还没执行旧命令时，AI重复给同一名村民发送命令。
     static int lastDecisionFrame = -10;
+    static int lastHouseAttemptFrame = -50;
+    static int nextHousePosition = 0;
+
+    // 在同一个程序中重新开始游戏时，帧数会从0重新计算。
+    // 同时重置这些静态变量，避免沿用上一局的冷却时间和建房位置。
+    if (info.GameFrame < lastDecisionFrame) {
+        lastDecisionFrame = -10;
+        lastHouseAttemptFrame = -50;
+        nextHousePosition = 0;
+    }
     if (info.GameFrame - lastDecisionFrame < 10)
         return;
     lastDecisionFrame = info.GameFrame;
 
-    // 2. 找到我方市镇中心。当前阶段虽然还不生产村民，但后续所有经济逻辑
-    // 都以市镇中心为基础；中心不存在时继续调度已经没有意义。
-    int centerSN = -1;
+    // 2. 找到我方市镇中心。第一阶段的村民生产和人口判断都依赖它，
+    // 如果中心已经被摧毁，就暂时停止经济调度。
+    const tagBuilding *center = nullptr;
     for (const tagBuilding &building : info.buildings) {
         if (building.Type == BUILDING_CENTER) {
-            centerSN = building.SN;
+            center = &building;
             break;
         }
     }
-    if (centerSN == -1)
+    if (center == nullptr)
         return;
 
-    // 先统计正在采集各类资源的陆地村民。这样新出现的空闲村民会被分配到
+    // 3. 统计正在采集各类资源的陆地村民。这样新出现的空闲村民会被分配到
     // 当前最缺人的一类，而不是所有人都去采集列表中的第一个资源。
     int foodWorkers = 0;
     int woodWorkers = 0;
     int stoneWorkers = 0;
+    int farmerCount = 0;
+    bool houseUnderConstruction = false;
+
+    for (const tagBuilding &building : info.buildings) {
+        if (building.Type == BUILDING_HOME && building.Percent < 100) {
+            houseUnderConstruction = true;
+            break;
+        }
+    }
 
     for (const tagFarmer &farmer : info.farmers) {
         if (farmer.FarmerSort != FARMERTYPE_FARMER)
             continue;
+
+        ++farmerCount;
 
         for (const tagResource &resource : info.resources) {
             if (farmer.WorkObjectSN != resource.SN)
@@ -144,14 +169,75 @@ void UsrAI::processData()
         }
     }
 
-    // 3. 只给空闲的陆地村民安排新任务。正在移动或工作的村民会继续执行
+    // 4. 人口只剩一个空位时提前建房。正在建造的房屋也算作“已经安排”，
+    // 否则AI会在房屋完成前连续放下多个地基，浪费木材和村民时间。
+    int builderSN = -1;
+    const bool needHouse = info.Human_MaxNum - info.Human_Num <= 1.0;
+    if (needHouse &&
+        !houseUnderConstruction &&
+        info.Wood >= BUILD_HOUSE_WOOD &&
+        info.GameFrame - lastHouseAttemptFrame >= 50) {
+        // 房屋按顺序尝试市镇中心周围的位置。某个位置被树木或地形挡住时，
+        // 50帧后会自动尝试下一个位置，不需要把地图占用规则复制进AI。
+        static const int houseOffsets[][2] = {
+            {4, 0}, {-3, 0}, {0, 4}, {0, -3},
+            {4, 4}, {-3, 4}, {4, -3}, {-3, -3},
+            {7, 0}, {-6, 0}, {0, 7}, {0, -6}
+        };
+        const int positionCount =
+            static_cast<int>(sizeof(houseOffsets) / sizeof(houseOffsets[0]));
+        const int positionIndex = nextHousePosition % positionCount;
+        const int houseDR = center->BlockDR + houseOffsets[positionIndex][0];
+        const int houseUR = center->BlockUR + houseOffsets[positionIndex][1];
+
+        // 选择离市镇中心最近的普通村民建房。建房是有意改变原任务，
+        // 因此这里允许从采集岗位临时抽调一人。
+        double nearestDistance = 0.0;
+        for (const tagFarmer &farmer : info.farmers) {
+            if (farmer.FarmerSort != FARMERTYPE_FARMER)
+                continue;
+
+            const double dr = farmer.BlockDR - center->BlockDR;
+            const double ur = farmer.BlockUR - center->BlockUR;
+            const double distance = dr * dr + ur * ur;
+            if (builderSN == -1 || distance < nearestDistance) {
+                builderSN = farmer.SN;
+                nearestDistance = distance;
+            }
+        }
+
+        if (builderSN != -1) {
+            HumanBuild(builderSN, BUILDING_HOME, houseDR, houseUR);
+            lastHouseAttemptFrame = info.GameFrame;
+            ++nextHousePosition;
+        }
+    }
+
+    // 5. 第一阶段把普通村民补到12人。市镇中心空闲、食物够用且人口
+    // 没有达到上限时才下达命令，避免每10帧重复请求或收到人口上限错误。
+    const int firstStageFarmerTarget = 12;
+    if (farmerCount < firstStageFarmerTarget &&
+        center->Percent >= 100 &&
+        center->Project == ACT_NULL &&
+        info.Meat >= BUILDING_CENTER_CREATEFARMER_FOOD &&
+        info.Human_Num < info.Human_MaxNum) {
+        BuildingAction(center->SN, BUILDING_CENTER_CREATEFARMER);
+    }
+
+    // 6. 正常比例仍是3:2:1；食物或木材低于安全线时临时增加对应权重。
+    // 这只影响新出现的空闲村民，不会强行打断正在采集的村民。
+    const int foodWeight = info.Meat < 150 ? 4 : 3;
+    const int woodWeight = info.Wood < 100 ? 3 : 2;
+
+    // 7. 只给空闲的陆地村民安排采集任务。正在移动或工作的村民会继续执行
     // 原来的命令，不需要也不应该每帧重新发送HumanAction。
     for (const tagFarmer &farmer : info.farmers) {
         if (farmer.FarmerSort != FARMERTYPE_FARMER ||
-            farmer.NowState != HUMAN_STATE_IDLE)
+            farmer.NowState != HUMAN_STATE_IDLE ||
+            farmer.SN == builderSN)
             continue;
 
-        // 4. 分别寻找离当前村民最近的食物、木材和石头，再按3:2:1分配。
+        // 分别寻找离当前村民最近的食物、木材和石头，再按当前权重分配。
         // 如果某一类资源当前不存在，选择函数会自动在其余资源中分配。
         const int foodSN = findNearestResource(info, farmer, GATHER_FOOD);
         const int woodSN = findNearestResource(info, farmer, GATHER_WOOD);
@@ -159,6 +245,8 @@ void UsrAI::processData()
         const GatherKind kind = chooseGatherKind(foodWorkers,
                                                   woodWorkers,
                                                   stoneWorkers,
+                                                  foodWeight,
+                                                  woodWeight,
                                                   foodSN != -1,
                                                   woodSN != -1,
                                                   stoneSN != -1);
