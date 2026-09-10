@@ -66,6 +66,17 @@ int findNearestResource(const tagInfo &info,
     return nearestSN;
 }
 
+// 判断村民是否正在修建尚未完工的建筑。建造过程中有些帧会短暂显示为空闲，
+// 不能只依赖NowState，否则采集命令会把正在施工的村民调走。
+bool isConstructingBuilding(const tagInfo &info, const tagFarmer &farmer)
+{
+    for (const tagBuilding &building : info.buildings) {
+        if (building.Percent < 100 && farmer.WorkObjectSN == building.SN)
+            return true;
+    }
+    return false;
+}
+
 // 按给定权重选择当前最缺人的任务。正常权重是3:2:1，资源不足时
 // 调用处会临时提高食物或木材权重。
 GatherKind chooseGatherKind(int foodWorkers,
@@ -73,6 +84,7 @@ GatherKind chooseGatherKind(int foodWorkers,
                             int stoneWorkers,
                             int foodWeight,
                             int woodWeight,
+                            int stoneWeight,
                             bool hasFood,
                             bool hasWood,
                             bool hasStone)
@@ -90,7 +102,9 @@ GatherKind chooseGatherKind(int foodWorkers,
         result = GATHER_WOOD;
         bestLoad = static_cast<double>(woodWorkers) / woodWeight;
     }
-    if (hasStone && (result == GATHER_NONE || stoneWorkers < bestLoad))
+    if (hasStone &&
+        (result == GATHER_NONE ||
+         static_cast<double>(stoneWorkers) / stoneWeight < bestLoad))
         result = GATHER_STONE;
 
     return result;
@@ -107,15 +121,23 @@ void UsrAI::processData()
     // processData可能在同一帧被多次调用。每隔10帧决策一次，既能及时响应，
     // 又能避免主线程还没执行旧命令时，AI重复给同一名村民发送命令。
     static int lastDecisionFrame = -10;
-    static int lastHouseAttemptFrame = -50;
-    static int nextHousePosition = 0;
+    static int lastBuildAttemptFrame = -50;
+    static int nextBuildPosition = 0;
+    static int towerResearchRequestFrame = -1;
+    static bool towerResearchRequested = false;
+    static bool towerResearchWasRunning = false;
+    static bool towerResearchCompleted = false;
 
     // 在同一个程序中重新开始游戏时，帧数会从0重新计算。
     // 同时重置这些静态变量，避免沿用上一局的冷却时间和建房位置。
     if (info.GameFrame < lastDecisionFrame) {
         lastDecisionFrame = -10;
-        lastHouseAttemptFrame = -50;
-        nextHousePosition = 0;
+        lastBuildAttemptFrame = -50;
+        nextBuildPosition = 0;
+        towerResearchRequestFrame = -1;
+        towerResearchRequested = false;
+        towerResearchWasRunning = false;
+        towerResearchCompleted = false;
     }
     if (info.GameFrame - lastDecisionFrame < 10)
         return;
@@ -139,13 +161,36 @@ void UsrAI::processData()
     int woodWorkers = 0;
     int stoneWorkers = 0;
     int farmerCount = 0;
+    int combatArmyCount = 0;
+    int slingerCount = 0;
+    int towerCount = 0;
     bool houseUnderConstruction = false;
+    bool otherBuildingUnderConstruction = false;
+    const tagBuilding *granary = nullptr;
+    const tagBuilding *armyCamp = nullptr;
 
     for (const tagBuilding &building : info.buildings) {
-        if (building.Type == BUILDING_HOME && building.Percent < 100) {
-            houseUnderConstruction = true;
-            break;
+        if (building.Percent < 100) {
+            if (building.Type == BUILDING_HOME)
+                houseUnderConstruction = true;
+            else
+                otherBuildingUnderConstruction = true;
         }
+        if (building.Type == BUILDING_GRANARY)
+            granary = &building;
+        else if (building.Type == BUILDING_ARMYCAMP)
+            armyCamp = &building;
+        else if (building.Type == BUILDING_ARROWTOWER)
+            ++towerCount;
+    }
+
+    for (const tagArmy &army : info.armies) {
+        // 祭司是开局英雄，不计入“基础守军”；战船也不参与陆地防守。
+        if (army.Sort == AT_PRIEST || army.Sort == AT_SHIP)
+            continue;
+        ++combatArmyCount;
+        if (army.Sort == AT_SLINGER)
+            ++slingerCount;
     }
 
     for (const tagFarmer &farmer : info.farmers) {
@@ -169,47 +214,76 @@ void UsrAI::processData()
         }
     }
 
-    // 4. 人口只剩一个空位时提前建房。正在建造的房屋也算作“已经安排”，
-    // 否则AI会在房屋完成前连续放下多个地基，浪费木材和村民时间。
+    // 4. 每次只安排一座建筑：人口紧张时房屋优先，其次依次补兵营、
+    // 谷仓和箭塔。串行建造可以避免同一名村民在一帧收到多个建造命令。
     int builderSN = -1;
     const bool needHouse = info.Human_MaxNum - info.Human_Num <= 1.0;
+    int buildingToBuild = -1;
     if (needHouse &&
         !houseUnderConstruction &&
-        info.Wood >= BUILD_HOUSE_WOOD &&
-        info.GameFrame - lastHouseAttemptFrame >= 50) {
-        // 房屋按顺序尝试市镇中心周围的位置。某个位置被树木或地形挡住时，
+        info.Wood >= BUILD_HOUSE_WOOD) {
+        buildingToBuild = BUILDING_HOME;
+    } else if (!otherBuildingUnderConstruction) {
+        if (armyCamp == nullptr && info.Wood >= BUILD_ARMYCAMP_WOOD)
+            buildingToBuild = BUILDING_ARMYCAMP;
+        else if (armyCamp != nullptr && armyCamp->Percent >= 100 &&
+                 granary == nullptr && info.Wood >= BUILD_GRANARY_WOOD)
+            buildingToBuild = BUILDING_GRANARY;
+        else if (towerResearchCompleted && towerCount == 0 &&
+                 info.Stone >= BUILD_ARROWTOWER_STONE)
+            buildingToBuild = BUILDING_ARROWTOWER;
+    }
+
+    if (buildingToBuild != -1 &&
+        info.GameFrame - lastBuildAttemptFrame >= 50) {
+        // 建筑按顺序尝试市镇中心周围的位置。某个位置被树木或地形挡住时，
         // 50帧后会自动尝试下一个位置，不需要把地图占用规则复制进AI。
-        static const int houseOffsets[][2] = {
-            {4, 0}, {-3, 0}, {0, 4}, {0, -3},
-            {4, 4}, {-3, 4}, {4, -3}, {-3, -3},
-            {7, 0}, {-6, 0}, {0, 7}, {0, -6}
+        static const int buildingOffsets[][2] = {
+            {4, 0}, {-4, 0}, {0, 4}, {0, -4},
+            {4, 4}, {-4, 4}, {4, -4}, {-4, -4},
+            {8, 0}, {-8, 0}, {0, 8}, {0, -8},
+            {8, 4}, {-8, 4}, {8, -4}, {-8, -4}
         };
         const int positionCount =
-            static_cast<int>(sizeof(houseOffsets) / sizeof(houseOffsets[0]));
-        const int positionIndex = nextHousePosition % positionCount;
-        const int houseDR = center->BlockDR + houseOffsets[positionIndex][0];
-        const int houseUR = center->BlockUR + houseOffsets[positionIndex][1];
+            static_cast<int>(sizeof(buildingOffsets) /
+                             sizeof(buildingOffsets[0]));
+        const int positionIndex = nextBuildPosition % positionCount;
+        const int buildDR = center->BlockDR + buildingOffsets[positionIndex][0];
+        const int buildUR = center->BlockUR + buildingOffsets[positionIndex][1];
 
-        // 选择离市镇中心最近的普通村民建房。建房是有意改变原任务，
-        // 因此这里允许从采集岗位临时抽调一人。
+        // 先避开与别人挤在同一格的村民，再选择离施工点最近的人。
+        // 固定地图中存在重叠出生的村民，直接选中容易因碰撞无法走出。
+        int leastCrowding = INT_MAX;
         double nearestDistance = 0.0;
         for (const tagFarmer &farmer : info.farmers) {
             if (farmer.FarmerSort != FARMERTYPE_FARMER)
                 continue;
 
-            const double dr = farmer.BlockDR - center->BlockDR;
-            const double ur = farmer.BlockUR - center->BlockUR;
+            if (isConstructingBuilding(info, farmer))
+                continue;
+
+            int crowding = 0;
+            for (const tagFarmer &other : info.farmers) {
+                if (other.BlockDR == farmer.BlockDR &&
+                    other.BlockUR == farmer.BlockUR)
+                    ++crowding;
+            }
+
+            const double dr = farmer.BlockDR - buildDR;
+            const double ur = farmer.BlockUR - buildUR;
             const double distance = dr * dr + ur * ur;
-            if (builderSN == -1 || distance < nearestDistance) {
+            if (builderSN == -1 || crowding < leastCrowding ||
+                (crowding == leastCrowding && distance < nearestDistance)) {
                 builderSN = farmer.SN;
+                leastCrowding = crowding;
                 nearestDistance = distance;
             }
         }
 
         if (builderSN != -1) {
-            HumanBuild(builderSN, BUILDING_HOME, houseDR, houseUR);
-            lastHouseAttemptFrame = info.GameFrame;
-            ++nextHousePosition;
+            HumanBuild(builderSN, buildingToBuild, buildDR, buildUR);
+            lastBuildAttemptFrame = info.GameFrame;
+            ++nextBuildPosition;
         }
     }
 
@@ -224,16 +298,68 @@ void UsrAI::processData()
         BuildingAction(center->SN, BUILDING_CENTER_CREATEFARMER);
     }
 
-    // 6. 正常比例仍是3:2:1；食物或木材低于安全线时临时增加对应权重。
-    // 这只影响新出现的空闲村民，不会强行打断正在采集的村民。
+    // 6. 谷仓建好后研究箭塔。先观察到项目进入运行状态，再等待它回到
+    // 空闲状态，才能确认研究真正完成并开始建造箭塔。
+    if (towerCount > 0)
+        towerResearchCompleted = true;
+
+    if (granary != nullptr && granary->Percent >= 100) {
+        if (granary->Project == BUILDING_GRANARY_ARROWTOWER) {
+            towerResearchRequested = true;
+            towerResearchWasRunning = true;
+        } else if (towerResearchWasRunning && granary->Project == ACT_NULL) {
+            towerResearchCompleted = true;
+        }
+
+        // 正常情况下命令会在下一轮进入运行状态。如果20帧后仍未开始，
+        // 说明命令被拒绝，清除标记后允许再次尝试。
+        if (towerResearchRequested && !towerResearchWasRunning &&
+            granary->Project == ACT_NULL &&
+            info.GameFrame - towerResearchRequestFrame >= 20) {
+            towerResearchRequested = false;
+        }
+
+        if (!towerResearchCompleted &&
+            !towerResearchRequested &&
+            granary->Project == ACT_NULL &&
+            info.Meat >= BUILDING_GRANARY_ARROWTOWER_FOOD) {
+            BuildingAction(granary->SN, BUILDING_GRANARY_ARROWTOWER);
+            towerResearchRequested = true;
+            towerResearchRequestFrame = info.GameFrame;
+        }
+    }
+
+    // 7. 村民经济成型后训练6名基础守军。先补1名投石兵克制第一波的
+    // 弓箭手，其余训练棍棒兵；兵营忙碌或人口已满时不会重复下令。
+    const int firstDefenseArmyTarget = 6;
+    if (armyCamp != nullptr &&
+        armyCamp->Percent >= 100 &&
+        armyCamp->Project == ACT_NULL &&
+        farmerCount >= firstStageFarmerTarget &&
+        combatArmyCount < firstDefenseArmyTarget &&
+        info.Human_Num < info.Human_MaxNum) {
+        if (slingerCount == 0 &&
+            info.Meat >= BUILDING_ARMYCAMP_CREATE_SLINGER_FOOD &&
+            info.Stone >= BUILDING_ARMYCAMP_CREATE_SLINGER_STONE) {
+            BuildingAction(armyCamp->SN, BUILDING_ARMYCAMP_CREATE_SLINGER);
+        } else if (info.Meat >= BUILDING_ARMYCAMP_CREATE_CLUBMAN_FOOD) {
+            BuildingAction(armyCamp->SN, BUILDING_ARMYCAMP_CREATE_CLUBMAN);
+        }
+    }
+
+    // 8. 正常比例仍是3:2:1；食物、木材不足或箭塔尚未建成时，
+    // 临时提高相应权重。这只影响新出现的空闲村民，不强行中断采集。
     const int foodWeight = info.Meat < 150 ? 4 : 3;
     const int woodWeight = info.Wood < 100 ? 3 : 2;
+    const int stoneWeight = towerCount == 0 &&
+                            info.Stone < BUILD_ARROWTOWER_STONE ? 2 : 1;
 
-    // 7. 只给空闲的陆地村民安排采集任务。正在移动或工作的村民会继续执行
+    // 9. 只给空闲的陆地村民安排采集任务。正在移动或工作的村民会继续执行
     // 原来的命令，不需要也不应该每帧重新发送HumanAction。
     for (const tagFarmer &farmer : info.farmers) {
         if (farmer.FarmerSort != FARMERTYPE_FARMER ||
             farmer.NowState != HUMAN_STATE_IDLE ||
+            isConstructingBuilding(info, farmer) ||
             farmer.SN == builderSN)
             continue;
 
@@ -247,6 +373,7 @@ void UsrAI::processData()
                                                   stoneWorkers,
                                                   foodWeight,
                                                   woodWeight,
+                                                  stoneWeight,
                                                   foodSN != -1,
                                                   woodSN != -1,
                                                   stoneSN != -1);
