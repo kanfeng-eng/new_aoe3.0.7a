@@ -46,4 +46,3 @@ res.rcc
 
 # 本地生成的架构文档
 docs/architecture/
-.qtc_clangd/
