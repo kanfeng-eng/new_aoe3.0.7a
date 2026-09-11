@@ -109,6 +109,15 @@ GatherKind chooseGatherKind(int foodWorkers,
 
     return result;
 }
+
+// 计算两个单位（或建筑）之间的块坐标距离平方。
+// 防守判断只比较远近，不开平方可以让代码更简单，也避免不必要的浮点计算。
+int blockDistanceSquared(const tagObj &first, const tagObj &second)
+{
+    const int dr = first.BlockDR - second.BlockDR;
+    const int ur = first.BlockUR - second.BlockUR;
+    return dr * dr + ur * ur;
+}
 }
 
 /* ============================== 主入口 ============================== */
@@ -164,6 +173,7 @@ void UsrAI::processData()
     int combatArmyCount = 0;
     int slingerCount = 0;
     int towerCount = 0;
+    const tagArmy *priest = nullptr;
     bool houseUnderConstruction = false;
     bool otherBuildingUnderConstruction = false;
     const tagBuilding *granary = nullptr;
@@ -186,7 +196,11 @@ void UsrAI::processData()
 
     for (const tagArmy &army : info.armies) {
         // 祭司是开局英雄，不计入“基础守军”；战船也不参与陆地防守。
-        if (army.Sort == AT_PRIEST || army.Sort == AT_SHIP)
+        if (army.Sort == AT_PRIEST) {
+            priest = &army;
+            continue;
+        }
+        if (army.Sort == AT_SHIP)
             continue;
         ++combatArmyCount;
         if (army.Sort == AT_SLINGER)
@@ -347,14 +361,140 @@ void UsrAI::processData()
         }
     }
 
-    // 8. 正常比例仍是3:2:1；食物、木材不足或箭塔尚未建成时，
+    // 8. 把基地周围20格作为防守区。只有进入这个范围的敌军
+    // 才会触发迎击，避免守军因为看到远处单位而离开基地。
+    const int defenseRadius = 20;
+    vector<const tagArmy *> nearbyEnemies;
+    for (const tagArmy &enemy : info.enemy_armies) {
+        if (enemy.Blood > 0 &&
+            blockDistanceSquared(*center, enemy) <=
+                defenseRadius * defenseRadius) {
+            nearbyEnemies.push_back(&enemy);
+        }
+    }
+
+    if (!nearbyEnemies.empty()) {
+        // 祭司优先转化离自己最近的敌军。ConvertCooldown为0
+        // 才表示技能可用；正在转化同一目标时不重复下令。
+        if (priest != nullptr && priest->ConvertCooldown == 0) {
+            const tagArmy *nearestEnemy = nullptr;
+            int nearestDistance = INT_MAX;
+            for (const tagArmy *enemy : nearbyEnemies) {
+                const int distance = blockDistanceSquared(*priest, *enemy);
+                if (distance < nearestDistance) {
+                    nearestEnemy = enemy;
+                    nearestDistance = distance;
+                }
+            }
+
+            if (nearestEnemy != nullptr &&
+                priest->WorkObjectSN != nearestEnemy->SN) {
+                HumanAction(priest->SN, nearestEnemy->SN);
+            }
+        } else if (priest != nullptr) {
+            // 转化后的20秒冷却期无法再出手。敌人靠近祭司时，
+            // 让他退到市镇中心旁，利用守军和箭塔保护自己。
+            const int priestDangerRadius = 7;
+            bool priestInDanger = false;
+            for (const tagArmy *enemy : nearbyEnemies) {
+                if (blockDistanceSquared(*priest, *enemy) <=
+                    priestDangerRadius * priestDangerRadius) {
+                    priestInDanger = true;
+                    break;
+                }
+            }
+
+            if (priestInDanger && priest->NowState != HUMAN_STATE_WALKING) {
+                const double blockSize = static_cast<double>(BLOCKSIDELENGTH);
+                HumanMove(priest->SN,
+                          (center->BlockDR + 0.5) * blockSize,
+                          (center->BlockUR + 0.5) * blockSize);
+            }
+        }
+
+        // 基础守军各自攻击离自己最近的入侵者。如果已经在攻击
+        // 防区内的敌人，保留原目标，避免频繁切换目标导致只走不打。
+        for (const tagArmy &army : info.armies) {
+            if (army.Sort == AT_PRIEST || army.Sort == AT_SHIP)
+                continue;
+
+            bool alreadyAttackingThreat = false;
+            for (const tagArmy *enemy : nearbyEnemies) {
+                if (army.WorkObjectSN == enemy->SN) {
+                    alreadyAttackingThreat = true;
+                    break;
+                }
+            }
+            if (alreadyAttackingThreat)
+                continue;
+
+            const tagArmy *nearestEnemy = nullptr;
+            int nearestDistance = INT_MAX;
+            for (const tagArmy *enemy : nearbyEnemies) {
+                const int distance = blockDistanceSquared(army, *enemy);
+                if (distance < nearestDistance) {
+                    nearestEnemy = enemy;
+                    nearestDistance = distance;
+                }
+            }
+            if (nearestEnemy != nullptr)
+                HumanAction(army.SN, nearestEnemy->SN);
+        }
+    } else {
+        // 没有入侵者时，把守军分散集结在市镇中心周围。
+        // 若上一个攻击目标已经退出防区，也会立即停止追击并归队。
+        static const int rallyOffsets[][2] = {
+            {6, 0}, {0, 6}, {-6, 0}, {0, -6}
+        };
+        const int rallyDistance = 3;
+        const double blockSize = static_cast<double>(BLOCKSIDELENGTH);
+
+        for (const tagArmy &army : info.armies) {
+            if (army.Sort == AT_PRIEST || army.Sort == AT_SHIP)
+                continue;
+
+            const int slot = army.SN % 4;
+            const int rallyDR = center->BlockDR + rallyOffsets[slot][0];
+            const int rallyUR = center->BlockUR + rallyOffsets[slot][1];
+            const int dr = army.BlockDR - rallyDR;
+            const int ur = army.BlockUR - rallyUR;
+            const bool farFromRally =
+                dr * dr + ur * ur > rallyDistance * rallyDistance;
+
+            if (army.WorkObjectSN != -1 ||
+                (army.NowState == HUMAN_STATE_IDLE && farFromRally)) {
+                HumanMove(army.SN,
+                          (rallyDR + 0.5) * blockSize,
+                          (rallyUR + 0.5) * blockSize);
+            }
+        }
+
+        // 祭司不参与普通编队，平时单独留在市镇中心旁。
+        // 这样第一波来临时既能及时转化，又不会成为最前排目标。
+        if (priest != nullptr) {
+            const int priestRallyDR = center->BlockDR - 3;
+            const int priestRallyUR = center->BlockUR - 3;
+            const int dr = priest->BlockDR - priestRallyDR;
+            const int ur = priest->BlockUR - priestRallyUR;
+            const bool farFromRally = dr * dr + ur * ur > 9;
+
+            if (priest->WorkObjectSN != -1 ||
+                (priest->NowState == HUMAN_STATE_IDLE && farFromRally)) {
+                HumanMove(priest->SN,
+                          (priestRallyDR + 0.5) * blockSize,
+                          (priestRallyUR + 0.5) * blockSize);
+            }
+        }
+    }
+
+    // 9. 正常比例仍是3:2:1；食物、木材不足或箭塔尚未建成时，
     // 临时提高相应权重。这只影响新出现的空闲村民，不强行中断采集。
     const int foodWeight = info.Meat < 150 ? 4 : 3;
     const int woodWeight = info.Wood < 100 ? 3 : 2;
     const int stoneWeight = towerCount == 0 &&
                             info.Stone < BUILD_ARROWTOWER_STONE ? 2 : 1;
 
-    // 9. 只给空闲的陆地村民安排采集任务。正在移动或工作的村民会继续执行
+    // 10. 只给空闲的陆地村民安排采集任务。正在移动或工作的村民会继续执行
     // 原来的命令，不需要也不应该每帧重新发送HumanAction。
     for (const tagFarmer &farmer : info.farmers) {
         if (farmer.FarmerSort != FARMERTYPE_FARMER ||
