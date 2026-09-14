@@ -14,61 +14,121 @@ ins UsrIns;
 
 namespace
 {
-// 采集任务的三种分类。NONE表示当前没有可分配的资源。
 enum GatherKind
 {
     GATHER_NONE,
     GATHER_FOOD,
     GATHER_WOOD,
-    GATHER_STONE
+    GATHER_STONE,
+    GATHER_GOLD
 };
 
-// 把游戏中的具体资源类型归入食物、木材或石头三类。
-// 第一阶段只选择浆果和瞪羚作为食物，暂时不让村民招惹狮子和大象。
-GatherKind getGatherKind(int resourceType)
+struct AiState
 {
-    if (resourceType == RESOURCE_BUSH || resourceType == RESOURCE_GAZELLE)
+    int lastFrame;
+    int lastBuildFrame;
+    int nextBuildPos;
+    bool bronzeStarted;
+    bool bronzeDone;
+    bool towerTechStarted;
+    bool towerTechDone;
+    bool clubUpgradeStarted;
+    bool clubUpgradeDone;
+    bool woodTechStarted;
+    bool woodTechDone;
+    bool wheelStarted;
+    bool wheelDone;
+    bool compositeStarted;
+    bool compositeDone;
+
+    AiState()
+        : lastFrame(-10),
+          lastBuildFrame(-80),
+          nextBuildPos(0),
+          bronzeStarted(false),
+          bronzeDone(false),
+          towerTechStarted(false),
+          towerTechDone(false),
+          clubUpgradeStarted(false),
+          clubUpgradeDone(false),
+          woodTechStarted(false),
+          woodTechDone(false),
+          wheelStarted(false),
+          wheelDone(false),
+          compositeStarted(false),
+          compositeDone(false)
+    {
+    }
+};
+
+GatherKind resourceKind(int type)
+{
+    if (type == RESOURCE_BUSH || type == RESOURCE_GAZELLE || type == RESOURCE_ELEPHANT)
         return GATHER_FOOD;
-    if (resourceType == RESOURCE_TREE)
+    if (type == RESOURCE_TREE)
         return GATHER_WOOD;
-    if (resourceType == RESOURCE_STONE)
+    if (type == RESOURCE_STONE)
         return GATHER_STONE;
+    if (type == RESOURCE_GOLD)
+        return GATHER_GOLD;
     return GATHER_NONE;
 }
 
-// 为一个村民寻找最近的指定资源，返回资源的SN。
-// 使用SN而不是数组下标，因为游戏每帧都会打乱资源和单位列表的顺序。
-int findNearestResource(const tagInfo &info,
-                        const tagFarmer &farmer,
-                        GatherKind wantedKind)
+int dist2(int aDR, int aUR, int bDR, int bUR)
 {
-    int nearestSN = -1;
-    double nearestDistance = 0.0;
+    const int dr = aDR - bDR;
+    const int ur = aUR - bUR;
+    return dr * dr + ur * ur;
+}
 
-    for (const tagResource &resource : info.resources) {
-        if (getGatherKind(resource.Type) != wantedKind)
+int dist2(const tagObj &a, const tagObj &b)
+{
+    return dist2(a.BlockDR, a.BlockUR, b.BlockDR, b.BlockUR);
+}
+
+int findNearestResource(const tagInfo &info, const tagFarmer &farmer, GatherKind wanted)
+{
+    int bestSN = -1;
+    double bestDistance = 0.0;
+
+    for (const tagResource &res : info.resources) {
+        if (resourceKind(res.Type) != wanted)
+            continue;
+        if (res.Blood <= 0 && res.Cnt <= 0)
             continue;
 
-        // 活着的动物用Blood表示是否有效，普通资源用Cnt表示剩余数量。
-        if (resource.Blood <= 0 && resource.Cnt <= 0)
-            continue;
-
-        const double dr = farmer.DR - resource.DR;
-        const double ur = farmer.UR - resource.UR;
-        const double distance = dr * dr + ur * ur;
-
-        if (nearestSN == -1 || distance < nearestDistance) {
-            nearestSN = resource.SN;
-            nearestDistance = distance;
+        const double dr = farmer.DR - res.DR;
+        const double ur = farmer.UR - res.UR;
+        const double d = dr * dr + ur * ur;
+        if (bestSN == -1 || d < bestDistance) {
+            bestSN = res.SN;
+            bestDistance = d;
         }
     }
 
-    return nearestSN;
+    return bestSN;
 }
 
-// 判断村民是否正在修建尚未完工的建筑。建造过程中有些帧会短暂显示为空闲，
-// 不能只依赖NowState，否则采集命令会把正在施工的村民调走。
-bool isConstructingBuilding(const tagInfo &info, const tagFarmer &farmer)
+int findNearestFarm(const tagInfo &info, const tagFarmer &farmer)
+{
+    int bestSN = -1;
+    int bestDistance = 0;
+
+    for (const tagBuilding &building : info.buildings) {
+        if (building.Type != BUILDING_FARM || building.Percent < 100 || building.Cnt <= 0)
+            continue;
+
+        const int d = dist2(farmer.BlockDR, farmer.BlockUR, building.BlockDR, building.BlockUR);
+        if (bestSN == -1 || d < bestDistance) {
+            bestSN = building.SN;
+            bestDistance = d;
+        }
+    }
+
+    return bestSN;
+}
+
+bool isBusyBuilding(const tagInfo &info, const tagFarmer &farmer)
 {
     for (const tagBuilding &building : info.buildings) {
         if (building.Percent < 100 && farmer.WorkObjectSN == building.SN)
@@ -77,17 +137,105 @@ bool isConstructingBuilding(const tagInfo &info, const tagFarmer &farmer)
     return false;
 }
 
-// 按给定权重选择当前最缺人的任务。正常权重是3:2:1，资源不足时
-// 调用处会临时提高食物或木材权重。
-GatherKind chooseGatherKind(int foodWorkers,
-                            int woodWorkers,
-                            int stoneWorkers,
-                            int foodWeight,
-                            int woodWeight,
-                            int stoneWeight,
-                            bool hasFood,
-                            bool hasWood,
-                            bool hasStone)
+const tagBuilding *findBuilding(const tagInfo &info, int type)
+{
+    for (const tagBuilding &building : info.buildings) {
+        if (building.Type == type && building.Percent >= 100)
+            return &building;
+    }
+    return nullptr;
+}
+
+const tagBuilding *findEnemyBuilding(const tagInfo &info, int type)
+{
+    for (const tagBuilding &building : info.enemy_buildings) {
+        if (building.Type == type && building.Blood > 0)
+            return &building;
+    }
+    return nullptr;
+}
+
+const tagBuilding *chooseEnemyAssaultBuilding(const tagInfo &info, const tagArmy &army)
+{
+    const tagBuilding *best = nullptr;
+    int bestScore = INT_MAX;
+
+    for (const tagBuilding &building : info.enemy_buildings) {
+        if (building.Blood <= 0 || building.Type == BUILDING_SIEGE)
+            continue;
+
+        int score = dist2(army.BlockDR, army.BlockUR, building.BlockDR, building.BlockUR);
+        if (building.Type == BUILDING_ARROWTOWER)
+            score -= 10000;
+        if (best == nullptr || score < bestScore) {
+            best = &building;
+            bestScore = score;
+        }
+    }
+
+    return best;
+}
+
+int countBuilding(const tagInfo &info, int type)
+{
+    int count = 0;
+    for (const tagBuilding &building : info.buildings) {
+        if (building.Type == type && building.Percent >= 100)
+            ++count;
+    }
+    return count;
+}
+
+bool hasBuildingInProgress(const tagInfo &info, int type)
+{
+    for (const tagBuilding &building : info.buildings) {
+        if (building.Type == type && building.Percent < 100)
+            return true;
+    }
+    return false;
+}
+
+bool hasAnyBuildingInProgress(const tagInfo &info)
+{
+    for (const tagBuilding &building : info.buildings) {
+        if (building.Percent < 100)
+            return true;
+    }
+    return false;
+}
+
+int countArmy(const tagInfo &info, int type)
+{
+    int count = 0;
+    for (const tagArmy &army : info.armies) {
+        if (army.Sort == type && army.Blood > 0)
+            ++count;
+    }
+    return count;
+}
+
+int countFarms(const tagInfo &info)
+{
+    int count = 0;
+    for (const tagBuilding &building : info.buildings) {
+        if (building.Type == BUILDING_FARM)
+            ++count;
+    }
+    return count;
+}
+
+GatherKind chooseJob(int foodWorkers,
+                     int woodWorkers,
+                     int stoneWorkers,
+                     int goldWorkers,
+                     int foodWeight,
+                     int woodWeight,
+                     int stoneWeight,
+                     int goldWeight,
+                     bool hasFood,
+                     bool hasWood,
+                     bool hasStone,
+                     bool hasGold)
 {
     GatherKind result = GATHER_NONE;
     double bestLoad = 0.0;
@@ -96,427 +244,532 @@ GatherKind chooseGatherKind(int foodWorkers,
         result = GATHER_FOOD;
         bestLoad = static_cast<double>(foodWorkers) / foodWeight;
     }
-    if (hasWood &&
-        (result == GATHER_NONE ||
-         static_cast<double>(woodWorkers) / woodWeight < bestLoad)) {
-        result = GATHER_WOOD;
-        bestLoad = static_cast<double>(woodWorkers) / woodWeight;
+    if (hasWood) {
+        const double load = static_cast<double>(woodWorkers) / woodWeight;
+        if (result == GATHER_NONE || load < bestLoad) {
+            result = GATHER_WOOD;
+            bestLoad = load;
+        }
     }
-    if (hasStone &&
-        (result == GATHER_NONE ||
-         static_cast<double>(stoneWorkers) / stoneWeight < bestLoad))
-        result = GATHER_STONE;
+    if (hasStone) {
+        const double load = static_cast<double>(stoneWorkers) / stoneWeight;
+        if (result == GATHER_NONE || load < bestLoad) {
+            result = GATHER_STONE;
+            bestLoad = load;
+        }
+    }
+    if (hasGold) {
+        const double load = static_cast<double>(goldWorkers) / goldWeight;
+        if (result == GATHER_NONE || load < bestLoad)
+            result = GATHER_GOLD;
+    }
 
     return result;
 }
 
-// 计算两个单位（或建筑）之间的块坐标距离平方。
-// 防守判断只比较远近，不开平方可以让代码更简单，也避免不必要的浮点计算。
-int blockDistanceSquared(const tagObj &first, const tagObj &second)
+int chooseBuilder(const tagInfo &info, int buildDR, int buildUR)
 {
-    const int dr = first.BlockDR - second.BlockDR;
-    const int ur = first.BlockUR - second.BlockUR;
-    return dr * dr + ur * ur;
+    int bestSN = -1;
+    int bestDistance = 0;
+
+    for (const tagFarmer &farmer : info.farmers) {
+        if (farmer.FarmerSort != FARMERTYPE_FARMER)
+            continue;
+        if (isBusyBuilding(info, farmer))
+            continue;
+
+        const int d = dist2(farmer.BlockDR, farmer.BlockUR, buildDR, buildUR);
+        if (bestSN == -1 || d < bestDistance) {
+            bestSN = farmer.SN;
+            bestDistance = d;
+        }
+    }
+
+    return bestSN;
+}
+
+bool tryBuild(UsrAI *ai,
+              const tagInfo &info,
+              AiState &state,
+              const tagBuilding &center,
+              int buildingType)
+{
+    if (info.GameFrame - state.lastBuildFrame < 60)
+        return false;
+
+    static const int offsets[][2] = {
+        {5, 0}, {-5, 0}, {0, 5}, {0, -5},
+        {5, 5}, {-5, 5}, {5, -5}, {-5, -5},
+        {9, 0}, {-9, 0}, {0, 9}, {0, -9},
+        {9, 5}, {-9, 5}, {9, -5}, {-9, -5},
+        {13, 0}, {-13, 0}, {0, 13}, {0, -13}
+    };
+
+    const int offsetCount = static_cast<int>(sizeof(offsets) / sizeof(offsets[0]));
+    for (int i = 0; i < offsetCount; ++i) {
+        const int pos = (state.nextBuildPos + i) % offsetCount;
+        const int buildDR = center.BlockDR + offsets[pos][0];
+        const int buildUR = center.BlockUR + offsets[pos][1];
+        const int builderSN = chooseBuilder(info, buildDR, buildUR);
+        if (builderSN == -1)
+            return false;
+
+        ai->HumanBuild(builderSN, buildingType, buildDR, buildUR);
+        state.lastBuildFrame = info.GameFrame;
+        state.nextBuildPos = pos + 1;
+        return true;
+    }
+
+    return false;
+}
+
+bool startedAndFinished(bool &started, bool &done, const tagBuilding *building, int project)
+{
+    if (done || building == nullptr)
+        return done;
+    if (building->Project == project) {
+        started = true;
+    } else if (started && building->Project == ACT_NULL) {
+        done = true;
+    }
+    return done;
+}
+
+const tagArmy *chooseEnemyTarget(const tagInfo &info,
+                                const tagArmy &army,
+                                const tagBuilding &center,
+                                const map<int, int> &targetLoads)
+{
+    const tagArmy *best = nullptr;
+    int bestScore = INT_MAX;
+
+    for (const tagArmy &enemy : info.enemy_armies) {
+        if (enemy.Blood <= 0)
+            continue;
+        const int centerLimit = 26;
+        const int armyLimit = 14;
+        if (dist2(enemy, center) > centerLimit * centerLimit &&
+            dist2(enemy, army) > armyLimit * armyLimit)
+            continue;
+
+        const map<int, int>::const_iterator load = targetLoads.find(enemy.SN);
+        const int assignedCount = load == targetLoads.end() ? 0 : load->second;
+        int score = dist2(army, enemy);
+        if (info.GameFrame >= 20000)
+            score += assignedCount * 100000;
+        if (enemy.Sort == AT_STONE_THROWER) {
+            score -= info.GameFrame >= 20000 ? 20000 : 10000;
+        } else if (enemy.Sort == AT_CHARIOT_ARCHER ||
+                   enemy.Sort == AT_COMPOSITE_BOWMAN || enemy.Sort == AT_BOWMAN) {
+            score -= info.GameFrame >= 20000 ? 5000 : 120;
+        }
+        if (best == nullptr || score < bestScore) {
+            best = &enemy;
+            bestScore = score;
+        }
+    }
+
+    return best;
 }
 }
 
 /* ============================== 主入口 ============================== */
 void UsrAI::processData()
 {
-    // 1. 每次决策首先取得当前帧的完整游戏快照。
-    // info只在本次调用中有效，下一次调用时必须重新获取。
     const tagInfo info = getInfo();
 
-    // processData可能在同一帧被多次调用。每隔10帧决策一次，既能及时响应，
-    // 又能避免主线程还没执行旧命令时，AI重复给同一名村民发送命令。
-    static int lastDecisionFrame = -10;
-    static int lastBuildAttemptFrame = -50;
-    static int nextBuildPosition = 0;
-    static int towerResearchRequestFrame = -1;
-    static bool towerResearchRequested = false;
-    static bool towerResearchWasRunning = false;
-    static bool towerResearchCompleted = false;
-
-    // 在同一个程序中重新开始游戏时，帧数会从0重新计算。
-    // 同时重置这些静态变量，避免沿用上一局的冷却时间和建房位置。
-    if (info.GameFrame < lastDecisionFrame) {
-        lastDecisionFrame = -10;
-        lastBuildAttemptFrame = -50;
-        nextBuildPosition = 0;
-        towerResearchRequestFrame = -1;
-        towerResearchRequested = false;
-        towerResearchWasRunning = false;
-        towerResearchCompleted = false;
-    }
-    if (info.GameFrame - lastDecisionFrame < 10)
+    static AiState state;
+    if (info.GameFrame < state.lastFrame)
+        state = AiState();
+    if (info.GameFrame - state.lastFrame < 10)
         return;
-    lastDecisionFrame = info.GameFrame;
+    state.lastFrame = info.GameFrame;
 
-    // 2. 找到我方市镇中心。第一阶段的村民生产和人口判断都依赖它，
-    // 如果中心已经被摧毁，就暂时停止经济调度。
-    const tagBuilding *center = nullptr;
-    for (const tagBuilding &building : info.buildings) {
-        if (building.Type == BUILDING_CENTER) {
-            center = &building;
-            break;
-        }
-    }
+    const tagBuilding *center = findBuilding(info, BUILDING_CENTER);
     if (center == nullptr)
         return;
 
-    // 3. 统计正在采集各类资源的陆地村民。这样新出现的空闲村民会被分配到
-    // 当前最缺人的一类，而不是所有人都去采集列表中的第一个资源。
+    const tagBuilding *granary = findBuilding(info, BUILDING_GRANARY);
+    const tagBuilding *stock = findBuilding(info, BUILDING_STOCK);
+    const tagBuilding *camp = findBuilding(info, BUILDING_ARMYCAMP);
+    const tagBuilding *market = findBuilding(info, BUILDING_MARKET);
+    const tagBuilding *range = findBuilding(info, BUILDING_RANGE);
+
+    const bool toolDone = info.civilizationStage >= CIVILIZATION_TOOLAGE;
+    state.bronzeDone = info.civilizationStage >= CIVILIZATION_BRONZEAGE;
+    startedAndFinished(state.towerTechStarted, state.towerTechDone, granary, BUILDING_GRANARY_ARROWTOWER);
+    startedAndFinished(state.clubUpgradeStarted, state.clubUpgradeDone, camp, BUILDING_ARMYCAMP_UPGRADE_CLUBMAN);
+    startedAndFinished(state.woodTechStarted, state.woodTechDone, market, BUILDING_MARKET_WOOD_UPGRADE);
+    startedAndFinished(state.wheelStarted, state.wheelDone, market, BUILDING_MARKET_WHEEL_UPGRADE);
+    startedAndFinished(state.compositeStarted, state.compositeDone, range, BUILDING_RANGE_UPGRADE_COMPOSITE_BOW);
+
+    const int farmerCount = static_cast<int>(info.farmers.size());
+    const int slingerCount = countArmy(info, AT_SLINGER);
+    const int bowCount = countArmy(info, AT_BOWMAN);
+    const int rangeCount = countBuilding(info, BUILDING_RANGE);
+    const int chariotArcherCount = countArmy(info, AT_CHARIOT_ARCHER);
+    const int compositeCount = countArmy(info, AT_COMPOSITE_BOWMAN);
+    const int fightingCount = static_cast<int>(info.armies.size()) - countArmy(info, AT_PRIEST);
+    const int towerCount = countBuilding(info, BUILDING_ARROWTOWER);
+    const int farmCount = countFarms(info);
+    const int farmTarget = info.GameFrame >= 18000 ? 10 : 5;
+
+    // 快速升级必须分两步：石器先升工具，工具时代才能再升铜器。
+    // 原先把第一次升级也记成“铜器升级已开始”，会导致复合弓永远无法解锁。
+    const int farmerTarget =
+        fightingCount < 14 ? 10 :
+        (fightingCount < 18 ? 12 : (state.bronzeDone ? 30 : 14));
+    if (farmerCount < farmerTarget &&
+        center->Project == ACT_NULL &&
+        info.Meat >= BUILDING_CENTER_CREATEFARMER_FOOD &&
+        info.Human_Num < info.Human_MaxNum) {
+        BuildingAction(center->SN, BUILDING_CENTER_CREATEFARMER);
+    } else if (!toolDone &&
+               center->Project == ACT_NULL &&
+               info.Meat >= BUILDING_CENTER_UPGRADE_TOOLAGE_FOOD) {
+        BuildingAction(center->SN, BUILDING_CENTER_UPGRADE);
+    } else if (toolDone && !state.bronzeDone &&
+               !state.bronzeStarted &&
+               fightingCount >= 10 &&
+               farmCount >= 4 &&
+               center->Project == ACT_NULL &&
+               info.Meat >= BUILDING_CENTER_UPGRADE_BRONZEAGE_FOOD) {
+        BuildingAction(center->SN, BUILDING_CENTER_UPGRADE);
+        state.bronzeStarted = true;
+    }
+
+    // 房屋优先，避免人口卡住；其它建筑一次只造一个，更稳。
+    const bool needHouse = info.Human_MaxNum - info.Human_Num <= 3.0;
+    if (needHouse && !hasBuildingInProgress(info, BUILDING_HOME) && info.Wood >= BUILD_HOUSE_WOOD) {
+        tryBuild(this, info, state, *center, BUILDING_HOME);
+    } else if (!hasAnyBuildingInProgress(info)) {
+        if (camp == nullptr && info.Wood >= BUILD_ARMYCAMP_WOOD) {
+            tryBuild(this, info, state, *center, BUILDING_ARMYCAMP);
+        } else if (granary == nullptr && info.Wood >= BUILD_GRANARY_WOOD) {
+            tryBuild(this, info, state, *center, BUILDING_GRANARY);
+        } else if (state.towerTechDone &&
+                   towerCount < (info.GameFrame >= 18500 && fightingCount >= 20 ? 3 : 1) &&
+                   info.Stone >= BUILD_ARROWTOWER_STONE) {
+            tryBuild(this, info, state, *center, BUILDING_ARROWTOWER);
+        } else if (range == nullptr && camp != nullptr && info.Wood >= BUILD_RANGE_WOOD) {
+            tryBuild(this, info, state, *center, BUILDING_RANGE);
+        } else if (market == nullptr && granary != nullptr && info.Wood >= BUILD_MARKET_WOOD) {
+            tryBuild(this, info, state, *center, BUILDING_MARKET);
+        } else if (market != nullptr && farmCount < farmTarget && info.Wood >= BUILD_FARM_WOOD) {
+            tryBuild(this, info, state, *center, BUILDING_FARM);
+        } else if (rangeCount < 2 && farmCount >= 3 && info.Wood >= BUILD_RANGE_WOOD) {
+            tryBuild(this, info, state, *center, BUILDING_RANGE);
+        } else if (stock == nullptr && info.Wood >= BUILD_STOCK_WOOD) {
+            tryBuild(this, info, state, *center, BUILDING_STOCK);
+        }
+    }
+
+    // 关键科技：箭塔守家，斧兵撑前两波，木材/车轮/复合弓服务后续造兵。
+    if (granary != nullptr && granary->Project == ACT_NULL &&
+        !state.towerTechStarted && !state.towerTechDone &&
+        info.Meat >= BUILDING_GRANARY_ARROWTOWER_FOOD) {
+        BuildingAction(granary->SN, BUILDING_GRANARY_ARROWTOWER);
+    }
+    if (camp != nullptr && camp->Project == ACT_NULL &&
+        !state.clubUpgradeStarted && !state.clubUpgradeDone &&
+        fightingCount >= 6 &&
+        info.Meat >= 200) {
+        BuildingAction(camp->SN, BUILDING_ARMYCAMP_UPGRADE_CLUBMAN);
+    }
+    if (market != nullptr && market->Project == ACT_NULL &&
+        !state.woodTechStarted && !state.woodTechDone &&
+        farmCount >= 3 &&
+        info.Meat >= 200 &&
+        info.Wood >= BUILDING_MARKET_WOOD_UPGRADE_WOOD) {
+        BuildingAction(market->SN, BUILDING_MARKET_WOOD_UPGRADE);
+    }
+    if (state.bronzeDone && market != nullptr && market->Project == ACT_NULL &&
+        !state.wheelStarted && !state.wheelDone &&
+        info.Meat >= BUILDING_MARKET_WHEEL_UPGRADE_FOOD &&
+        info.Wood >= BUILDING_MARKET_WHEEL_UPGRADE_WOOD) {
+        BuildingAction(market->SN, BUILDING_MARKET_WHEEL_UPGRADE);
+    }
+    if (state.bronzeDone && range != nullptr && range->Project == ACT_NULL &&
+        !state.compositeStarted && !state.compositeDone &&
+        info.Meat >= BUILDING_RANGE_UPGRADE_COMPOSITE_BOW_FOOD &&
+        info.Wood >= BUILDING_RANGE_UPGRADE_COMPOSITE_BOW_WOOD) {
+        BuildingAction(range->SN, BUILDING_RANGE_UPGRADE_COMPOSITE_BOW);
+    }
+    // 造兵：兵营先保命；靶场建好后持续出远程，铜器后转战车弓/复合弓。
+    if (camp != nullptr && camp->Percent >= 100 && camp->Project == ACT_NULL &&
+        info.Human_Num < info.Human_MaxNum) {
+        if (fightingCount >= 4 && slingerCount < 1 &&
+            info.Meat >= BUILDING_ARMYCAMP_CREATE_SLINGER_FOOD &&
+            info.Stone >= BUILDING_ARMYCAMP_CREATE_SLINGER_STONE) {
+            BuildingAction(camp->SN, BUILDING_ARMYCAMP_CREATE_SLINGER);
+        } else if (fightingCount < (state.bronzeDone ? 28 : 24) &&
+                   info.Meat >= BUILDING_ARMYCAMP_CREATE_CLUBMAN_FOOD) {
+            BuildingAction(camp->SN, BUILDING_ARMYCAMP_CREATE_CLUBMAN);
+        }
+    }
+    for (const tagBuilding &oneRange : info.buildings) {
+        if (oneRange.Type != BUILDING_RANGE ||
+            oneRange.Percent < 100 ||
+            oneRange.Project != ACT_NULL ||
+            info.Human_Num >= info.Human_MaxNum)
+            continue;
+        // 先把市场和农田建起来，避免靶场吃光木材后经济永久停摆。
+        if (info.GameFrame < 15000 && (market == nullptr || farmCount < 3))
+            continue;
+        if (info.GameFrame < 15000 && fightingCount < 10)
+            continue;
+
+        if (state.wheelDone && chariotArcherCount < 14 &&
+            info.Meat >= BUILDING_RANGE_CREATE_CHARIOT_ARCHER_FOOD &&
+            info.Wood >= BUILDING_RANGE_CREATE_CHARIOT_ARCHER_WOOD) {
+            BuildingAction(oneRange.SN, BUILDING_RANGE_CREATE_CHARIOT_ARCHER);
+        } else if (state.compositeDone && compositeCount < 12 &&
+                   info.Meat >= BUILDING_RANGE_CREATE_COMPOSITE_BOWMAN_FOOD &&
+                   info.Gold >= BUILDING_RANGE_CREATE_COMPOSITE_BOWMAN_GOLD) {
+            BuildingAction(oneRange.SN, BUILDING_RANGE_CREATE_COMPOSITE_BOWMAN);
+        } else if (bowCount < 32 &&
+                   info.Meat >= BUILDING_RANGE_CREATE_BOWMAN_FOOD &&
+                   info.Wood >= BUILDING_RANGE_CREATE_BOWMAN_WOOD) {
+            BuildingAction(oneRange.SN, BUILDING_RANGE_CREATE_BOWMAN);
+        }
+    }
+
+    // 守家：敌人靠近基地就集火，优先处理投石车和远程兵。
+    const tagArmy *baseThreat = nullptr;
+    int baseThreatScore = INT_MAX;
+    for (const tagArmy &enemy : info.enemy_armies) {
+        if (enemy.Blood <= 0 || dist2(enemy, *center) > 26 * 26)
+            continue;
+
+        int score = dist2(enemy, *center);
+        if (enemy.Sort == AT_STONE_THROWER)
+            score -= 10000;
+        else if (enemy.Sort == AT_CHARIOT_ARCHER ||
+                 enemy.Sort == AT_COMPOSITE_BOWMAN ||
+                 enemy.Sort == AT_BOWMAN)
+            score -= 200;
+
+        if (baseThreat == nullptr || score < baseThreatScore) {
+            baseThreat = &enemy;
+            baseThreatScore = score;
+        }
+    }
+
+    // 箭塔不会自动选择目标，和守军一样优先射击当前最危险的敌人。
+    if (baseThreat != nullptr) {
+        for (const tagBuilding &building : info.buildings) {
+            if (building.Type == BUILDING_ARROWTOWER &&
+                building.Percent >= 100 && building.Project != baseThreat->SN) {
+                HumanAction(building.SN, baseThreat->SN);
+            }
+        }
+    }
+
+    const bool assaultMode = info.GameFrame > 25500 &&
+                             info.enemy_armies.empty() &&
+                             fightingCount >= 30;
+
+    const tagArmy *priest = nullptr;
+    for (const tagArmy &army : info.armies) {
+        if (army.Sort == AT_PRIEST && army.Blood > 0) {
+            priest = &army;
+            break;
+        }
+    }
+
+    // 祭司只负责转化和保命，不把他当普通近战单位使用。
+    if (priest != nullptr) {
+        const tagArmy *escapeThreat = baseThreat;
+        int escapeDistance = escapeThreat == nullptr ? INT_MAX : dist2(*priest, *escapeThreat);
+        if (info.GameFrame >= 20000) {
+            for (const tagArmy &enemy : info.enemy_armies) {
+                const int distance = dist2(*priest, enemy);
+                if (enemy.Blood > 0 && distance < escapeDistance) {
+                    escapeThreat = &enemy;
+                    escapeDistance = distance;
+                }
+            }
+        }
+
+        if (baseThreat != nullptr && priest->ConvertCooldown == 0) {
+            if (priest->WorkObjectSN != baseThreat->SN)
+                HumanAction(priest->SN, baseThreat->SN);
+        } else if (escapeThreat != nullptr &&
+                   escapeDistance <= (info.GameFrame >= 20000 ? 12 * 12 : 8 * 8)) {
+            const double block = static_cast<double>(BLOCKSIDELENGTH);
+            int fleeDR;
+            int fleeUR;
+            if (info.GameFrame >= 20000) {
+                // 第三波敌人多，沿威胁侧面的方向绕基地移动，避免直线折返穿过敌群。
+                fleeDR = center->BlockDR +
+                          (escapeThreat->BlockUR >= center->BlockUR ? -12 : 12);
+                fleeUR = center->BlockUR +
+                          (escapeThreat->BlockDR >= center->BlockDR ? 12 : -12);
+            } else {
+                fleeDR = center->BlockDR +
+                          (center->BlockDR >= escapeThreat->BlockDR ? 8 : -8);
+                fleeUR = center->BlockUR +
+                          (center->BlockUR >= escapeThreat->BlockUR ? 8 : -8);
+            }
+            HumanMove(priest->SN,
+                      (fleeDR + 0.5) * block,
+                      (fleeUR + 0.5) * block);
+        } else if (assaultMode) {
+            // 清完三波以后，祭司先到攻城厂边缘；看见目标就直接转化。
+            const tagBuilding *enemySiege = findEnemyBuilding(info, BUILDING_SIEGE);
+            if (enemySiege != nullptr && priest->ConvertCooldown == 0 &&
+                priest->WorkObjectSN != enemySiege->SN) {
+                HumanAction(priest->SN, enemySiege->SN);
+            } else if (dist2(priest->BlockDR, priest->BlockUR, 23, 86) > 9) {
+                const double block = static_cast<double>(BLOCKSIDELENGTH);
+                HumanMove(priest->SN, (23 + 0.5) * block, (86 + 0.5) * block);
+            }
+        } else if (info.GameFrame > 23500) {
+            // 三波进攻结束后，转化敌方攻城器械厂才算真正通关。
+            const tagBuilding *enemySiege = findEnemyBuilding(info, BUILDING_SIEGE);
+            if (enemySiege != nullptr && priest->ConvertCooldown == 0 &&
+                priest->WorkObjectSN != enemySiege->SN) {
+                HumanAction(priest->SN, enemySiege->SN);
+            }
+        } else if (priest->NowState == HUMAN_STATE_IDLE &&
+                   dist2(priest->BlockDR, priest->BlockUR,
+                         center->BlockDR - 3, center->BlockUR - 3) > 9) {
+            const double block = static_cast<double>(BLOCKSIDELENGTH);
+            HumanMove(priest->SN,
+                      (center->BlockDR - 3 + 0.5) * block,
+                      (center->BlockUR - 3 + 0.5) * block);
+        }
+    }
+
+    map<int, int> targetLoads;
+    for (const tagArmy &army : info.armies) {
+        if (army.Blood <= 0 || army.Sort == AT_SHIP)
+            continue;
+
+        if (army.Sort == AT_PRIEST)
+            continue;
+
+        const tagArmy *target = chooseEnemyTarget(info, army, *center, targetLoads);
+        if (target != nullptr) {
+            ++targetLoads[target->SN];
+            if (army.WorkObjectSN != target->SN)
+                HumanAction(army.SN, target->SN);
+            continue;
+        }
+
+        if (assaultMode) {
+            const tagBuilding *buildingTarget = chooseEnemyAssaultBuilding(info, army);
+            if (buildingTarget != nullptr) {
+                if (army.WorkObjectSN != buildingTarget->SN)
+                    HumanAction(army.SN, buildingTarget->SN);
+                continue;
+            }
+
+            const int slot = army.SN % 9;
+            const int assaultDR = 18 + slot % 3;
+            const int assaultUR = 84 + slot / 3;
+            if (dist2(army.BlockDR, army.BlockUR, assaultDR, assaultUR) > 9) {
+                const double block = static_cast<double>(BLOCKSIDELENGTH);
+                HumanMove(army.SN,
+                          (assaultDR + 0.5) * block,
+                          (assaultUR + 0.5) * block);
+            }
+            continue;
+        }
+
+        // 没敌人时回防，不追太远，避免第二、三波来时家里没人。
+        if (army.Sort != AT_PRIEST && army.NowState == HUMAN_STATE_IDLE) {
+            const int slot = army.SN % 6;
+            const int rallyDR = center->BlockDR + (slot % 3 - 1) * 4;
+            const int rallyUR = center->BlockUR + (slot / 3 == 0 ? -5 : 5);
+            if (dist2(army.BlockDR, army.BlockUR, rallyDR, rallyUR) > 16) {
+                const double block = static_cast<double>(BLOCKSIDELENGTH);
+                HumanMove(army.SN, (rallyDR + 0.5) * block, (rallyUR + 0.5) * block);
+            }
+        }
+    }
+
+    // 资源分配：先冲食物升铜，升铜后提高木材和黄金，保证靶场不断兵。
     int foodWorkers = 0;
     int woodWorkers = 0;
     int stoneWorkers = 0;
-    int farmerCount = 0;
-    int combatArmyCount = 0;
-    int slingerCount = 0;
-    int towerCount = 0;
-    const tagArmy *priest = nullptr;
-    bool houseUnderConstruction = false;
-    bool otherBuildingUnderConstruction = false;
-    const tagBuilding *granary = nullptr;
-    const tagBuilding *armyCamp = nullptr;
-
-    for (const tagBuilding &building : info.buildings) {
-        if (building.Percent < 100) {
-            if (building.Type == BUILDING_HOME)
-                houseUnderConstruction = true;
-            else
-                otherBuildingUnderConstruction = true;
-        }
-        if (building.Type == BUILDING_GRANARY)
-            granary = &building;
-        else if (building.Type == BUILDING_ARMYCAMP)
-            armyCamp = &building;
-        else if (building.Type == BUILDING_ARROWTOWER)
-            ++towerCount;
-    }
-
-    for (const tagArmy &army : info.armies) {
-        // 祭司是开局英雄，不计入“基础守军”；战船也不参与陆地防守。
-        if (army.Sort == AT_PRIEST) {
-            priest = &army;
-            continue;
-        }
-        if (army.Sort == AT_SHIP)
-            continue;
-        ++combatArmyCount;
-        if (army.Sort == AT_SLINGER)
-            ++slingerCount;
-    }
-
+    int goldWorkers = 0;
     for (const tagFarmer &farmer : info.farmers) {
         if (farmer.FarmerSort != FARMERTYPE_FARMER)
             continue;
-
-        ++farmerCount;
-
-        for (const tagResource &resource : info.resources) {
-            if (farmer.WorkObjectSN != resource.SN)
+        for (const tagResource &res : info.resources) {
+            if (farmer.WorkObjectSN != res.SN)
                 continue;
-
-            const GatherKind kind = getGatherKind(resource.Type);
+            const GatherKind kind = resourceKind(res.Type);
             if (kind == GATHER_FOOD)
                 ++foodWorkers;
             else if (kind == GATHER_WOOD)
                 ++woodWorkers;
             else if (kind == GATHER_STONE)
                 ++stoneWorkers;
-            break;
+            else if (kind == GATHER_GOLD)
+                ++goldWorkers;
+        }
+        for (const tagBuilding &building : info.buildings) {
+            if (building.Type == BUILDING_FARM && farmer.WorkObjectSN == building.SN)
+                ++foodWorkers;
         }
     }
 
-    // 4. 每次只安排一座建筑：人口紧张时房屋优先，其次依次补兵营、
-    // 谷仓和箭塔。串行建造可以避免同一名村民在一帧收到多个建造命令。
-    int builderSN = -1;
-    const bool needHouse = info.Human_MaxNum - info.Human_Num <= 1.0;
-    int buildingToBuild = -1;
-    if (needHouse &&
-        !houseUnderConstruction &&
-        info.Wood >= BUILD_HOUSE_WOOD) {
-        buildingToBuild = BUILDING_HOME;
-    } else if (!otherBuildingUnderConstruction) {
-        if (armyCamp == nullptr && info.Wood >= BUILD_ARMYCAMP_WOOD)
-            buildingToBuild = BUILDING_ARMYCAMP;
-        else if (armyCamp != nullptr && armyCamp->Percent >= 100 &&
-                 granary == nullptr && info.Wood >= BUILD_GRANARY_WOOD)
-            buildingToBuild = BUILDING_GRANARY;
-        else if (towerResearchCompleted && towerCount == 0 &&
-                 info.Stone >= BUILD_ARROWTOWER_STONE)
-            buildingToBuild = BUILDING_ARROWTOWER;
-    }
+    const int foodWeight = info.Meat < 120 ? 10 : (info.Meat > 300 ? 3 : 6);
+    const int woodWeight = info.Wood < 120 ? 5 : (state.bronzeDone ? 5 : 3);
+    const bool needStone = towerCount < 1 ||
+                           (info.GameFrame >= 17500 &&
+                            towerCount < 3 &&
+                            info.Stone < BUILD_ARROWTOWER_STONE);
+    const int stoneWeight = 1;
+    const int goldWeight = state.bronzeDone ? 3 : 1;
 
-    if (buildingToBuild != -1 &&
-        info.GameFrame - lastBuildAttemptFrame >= 50) {
-        // 建筑按顺序尝试市镇中心周围的位置。某个位置被树木或地形挡住时，
-        // 50帧后会自动尝试下一个位置，不需要把地图占用规则复制进AI。
-        static const int buildingOffsets[][2] = {
-            {4, 0}, {-4, 0}, {0, 4}, {0, -4},
-            {4, 4}, {-4, 4}, {4, -4}, {-4, -4},
-            {8, 0}, {-8, 0}, {0, 8}, {0, -8},
-            {8, 4}, {-8, 4}, {8, -4}, {-8, -4}
-        };
-        const int positionCount =
-            static_cast<int>(sizeof(buildingOffsets) /
-                             sizeof(buildingOffsets[0]));
-        const int positionIndex = nextBuildPosition % positionCount;
-        const int buildDR = center->BlockDR + buildingOffsets[positionIndex][0];
-        const int buildUR = center->BlockUR + buildingOffsets[positionIndex][1];
-
-        // 先避开与别人挤在同一格的村民，再选择离施工点最近的人。
-        // 固定地图中存在重叠出生的村民，直接选中容易因碰撞无法走出。
-        int leastCrowding = INT_MAX;
-        double nearestDistance = 0.0;
-        for (const tagFarmer &farmer : info.farmers) {
-            if (farmer.FarmerSort != FARMERTYPE_FARMER)
-                continue;
-
-            if (isConstructingBuilding(info, farmer))
-                continue;
-
-            int crowding = 0;
-            for (const tagFarmer &other : info.farmers) {
-                if (other.BlockDR == farmer.BlockDR &&
-                    other.BlockUR == farmer.BlockUR)
-                    ++crowding;
-            }
-
-            const double dr = farmer.BlockDR - buildDR;
-            const double ur = farmer.BlockUR - buildUR;
-            const double distance = dr * dr + ur * ur;
-            if (builderSN == -1 || crowding < leastCrowding ||
-                (crowding == leastCrowding && distance < nearestDistance)) {
-                builderSN = farmer.SN;
-                leastCrowding = crowding;
-                nearestDistance = distance;
-            }
-        }
-
-        if (builderSN != -1) {
-            HumanBuild(builderSN, buildingToBuild, buildDR, buildUR);
-            lastBuildAttemptFrame = info.GameFrame;
-            ++nextBuildPosition;
-        }
-    }
-
-    // 5. 第一阶段把普通村民补到12人。市镇中心空闲、食物够用且人口
-    // 没有达到上限时才下达命令，避免每10帧重复请求或收到人口上限错误。
-    const int firstStageFarmerTarget = 12;
-    if (farmerCount < firstStageFarmerTarget &&
-        center->Percent >= 100 &&
-        center->Project == ACT_NULL &&
-        info.Meat >= BUILDING_CENTER_CREATEFARMER_FOOD &&
-        info.Human_Num < info.Human_MaxNum) {
-        BuildingAction(center->SN, BUILDING_CENTER_CREATEFARMER);
-    }
-
-    // 6. 谷仓建好后研究箭塔。先观察到项目进入运行状态，再等待它回到
-    // 空闲状态，才能确认研究真正完成并开始建造箭塔。
-    if (towerCount > 0)
-        towerResearchCompleted = true;
-
-    if (granary != nullptr && granary->Percent >= 100) {
-        if (granary->Project == BUILDING_GRANARY_ARROWTOWER) {
-            towerResearchRequested = true;
-            towerResearchWasRunning = true;
-        } else if (towerResearchWasRunning && granary->Project == ACT_NULL) {
-            towerResearchCompleted = true;
-        }
-
-        // 正常情况下命令会在下一轮进入运行状态。如果20帧后仍未开始，
-        // 说明命令被拒绝，清除标记后允许再次尝试。
-        if (towerResearchRequested && !towerResearchWasRunning &&
-            granary->Project == ACT_NULL &&
-            info.GameFrame - towerResearchRequestFrame >= 20) {
-            towerResearchRequested = false;
-        }
-
-        if (!towerResearchCompleted &&
-            !towerResearchRequested &&
-            granary->Project == ACT_NULL &&
-            info.Meat >= BUILDING_GRANARY_ARROWTOWER_FOOD) {
-            BuildingAction(granary->SN, BUILDING_GRANARY_ARROWTOWER);
-            towerResearchRequested = true;
-            towerResearchRequestFrame = info.GameFrame;
-        }
-    }
-
-    // 7. 村民经济成型后训练6名基础守军。先补1名投石兵克制第一波的
-    // 弓箭手，其余训练棍棒兵；兵营忙碌或人口已满时不会重复下令。
-    const int firstDefenseArmyTarget = 6;
-    if (armyCamp != nullptr &&
-        armyCamp->Percent >= 100 &&
-        armyCamp->Project == ACT_NULL &&
-        farmerCount >= firstStageFarmerTarget &&
-        combatArmyCount < firstDefenseArmyTarget &&
-        info.Human_Num < info.Human_MaxNum) {
-        if (slingerCount == 0 &&
-            info.Meat >= BUILDING_ARMYCAMP_CREATE_SLINGER_FOOD &&
-            info.Stone >= BUILDING_ARMYCAMP_CREATE_SLINGER_STONE) {
-            BuildingAction(armyCamp->SN, BUILDING_ARMYCAMP_CREATE_SLINGER);
-        } else if (info.Meat >= BUILDING_ARMYCAMP_CREATE_CLUBMAN_FOOD) {
-            BuildingAction(armyCamp->SN, BUILDING_ARMYCAMP_CREATE_CLUBMAN);
-        }
-    }
-
-    // 8. 把基地周围20格作为防守区。只有进入这个范围的敌军
-    // 才会触发迎击，避免守军因为看到远处单位而离开基地。
-    const int defenseRadius = 20;
-    vector<const tagArmy *> nearbyEnemies;
-    for (const tagArmy &enemy : info.enemy_armies) {
-        if (enemy.Blood > 0 &&
-            blockDistanceSquared(*center, enemy) <=
-                defenseRadius * defenseRadius) {
-            nearbyEnemies.push_back(&enemy);
-        }
-    }
-
-    if (!nearbyEnemies.empty()) {
-        // 祭司优先转化离自己最近的敌军。ConvertCooldown为0
-        // 才表示技能可用；正在转化同一目标时不重复下令。
-        if (priest != nullptr && priest->ConvertCooldown == 0) {
-            const tagArmy *nearestEnemy = nullptr;
-            int nearestDistance = INT_MAX;
-            for (const tagArmy *enemy : nearbyEnemies) {
-                const int distance = blockDistanceSquared(*priest, *enemy);
-                if (distance < nearestDistance) {
-                    nearestEnemy = enemy;
-                    nearestDistance = distance;
-                }
-            }
-
-            if (nearestEnemy != nullptr &&
-                priest->WorkObjectSN != nearestEnemy->SN) {
-                HumanAction(priest->SN, nearestEnemy->SN);
-            }
-        } else if (priest != nullptr) {
-            // 转化后的20秒冷却期无法再出手。敌人靠近祭司时，
-            // 让他退到市镇中心旁，利用守军和箭塔保护自己。
-            const int priestDangerRadius = 7;
-            bool priestInDanger = false;
-            for (const tagArmy *enemy : nearbyEnemies) {
-                if (blockDistanceSquared(*priest, *enemy) <=
-                    priestDangerRadius * priestDangerRadius) {
-                    priestInDanger = true;
-                    break;
-                }
-            }
-
-            if (priestInDanger && priest->NowState != HUMAN_STATE_WALKING) {
-                const double blockSize = static_cast<double>(BLOCKSIDELENGTH);
-                HumanMove(priest->SN,
-                          (center->BlockDR + 0.5) * blockSize,
-                          (center->BlockUR + 0.5) * blockSize);
-            }
-        }
-
-        // 基础守军各自攻击离自己最近的入侵者。如果已经在攻击
-        // 防区内的敌人，保留原目标，避免频繁切换目标导致只走不打。
-        for (const tagArmy &army : info.armies) {
-            if (army.Sort == AT_PRIEST || army.Sort == AT_SHIP)
-                continue;
-
-            bool alreadyAttackingThreat = false;
-            for (const tagArmy *enemy : nearbyEnemies) {
-                if (army.WorkObjectSN == enemy->SN) {
-                    alreadyAttackingThreat = true;
-                    break;
-                }
-            }
-            if (alreadyAttackingThreat)
-                continue;
-
-            const tagArmy *nearestEnemy = nullptr;
-            int nearestDistance = INT_MAX;
-            for (const tagArmy *enemy : nearbyEnemies) {
-                const int distance = blockDistanceSquared(army, *enemy);
-                if (distance < nearestDistance) {
-                    nearestEnemy = enemy;
-                    nearestDistance = distance;
-                }
-            }
-            if (nearestEnemy != nullptr)
-                HumanAction(army.SN, nearestEnemy->SN);
-        }
-    } else {
-        // 没有入侵者时，把守军分散集结在市镇中心周围。
-        // 若上一个攻击目标已经退出防区，也会立即停止追击并归队。
-        static const int rallyOffsets[][2] = {
-            {6, 0}, {0, 6}, {-6, 0}, {0, -6}
-        };
-        const int rallyDistance = 3;
-        const double blockSize = static_cast<double>(BLOCKSIDELENGTH);
-
-        for (const tagArmy &army : info.armies) {
-            if (army.Sort == AT_PRIEST || army.Sort == AT_SHIP)
-                continue;
-
-            const int slot = army.SN % 4;
-            const int rallyDR = center->BlockDR + rallyOffsets[slot][0];
-            const int rallyUR = center->BlockUR + rallyOffsets[slot][1];
-            const int dr = army.BlockDR - rallyDR;
-            const int ur = army.BlockUR - rallyUR;
-            const bool farFromRally =
-                dr * dr + ur * ur > rallyDistance * rallyDistance;
-
-            if (army.WorkObjectSN != -1 ||
-                (army.NowState == HUMAN_STATE_IDLE && farFromRally)) {
-                HumanMove(army.SN,
-                          (rallyDR + 0.5) * blockSize,
-                          (rallyUR + 0.5) * blockSize);
-            }
-        }
-
-        // 祭司不参与普通编队，平时单独留在市镇中心旁。
-        // 这样第一波来临时既能及时转化，又不会成为最前排目标。
-        if (priest != nullptr) {
-            const int priestRallyDR = center->BlockDR - 3;
-            const int priestRallyUR = center->BlockUR - 3;
-            const int dr = priest->BlockDR - priestRallyDR;
-            const int ur = priest->BlockUR - priestRallyUR;
-            const bool farFromRally = dr * dr + ur * ur > 9;
-
-            if (priest->WorkObjectSN != -1 ||
-                (priest->NowState == HUMAN_STATE_IDLE && farFromRally)) {
-                HumanMove(priest->SN,
-                          (priestRallyDR + 0.5) * blockSize,
-                          (priestRallyUR + 0.5) * blockSize);
-            }
-        }
-    }
-
-    // 9. 正常比例仍是3:2:1；食物、木材不足或箭塔尚未建成时，
-    // 临时提高相应权重。这只影响新出现的空闲村民，不强行中断采集。
-    const int foodWeight = info.Meat < 150 ? 4 : 3;
-    const int woodWeight = info.Wood < 100 ? 3 : 2;
-    const int stoneWeight = towerCount == 0 &&
-                            info.Stone < BUILD_ARROWTOWER_STONE ? 2 : 1;
-
-    // 10. 只给空闲的陆地村民安排采集任务。正在移动或工作的村民会继续执行
-    // 原来的命令，不需要也不应该每帧重新发送HumanAction。
     for (const tagFarmer &farmer : info.farmers) {
-        if (farmer.FarmerSort != FARMERTYPE_FARMER ||
-            farmer.NowState != HUMAN_STATE_IDLE ||
-            isConstructingBuilding(info, farmer) ||
-            farmer.SN == builderSN)
+        if (farmer.FarmerSort != FARMERTYPE_FARMER || isBusyBuilding(info, farmer))
             continue;
 
-        // 分别寻找离当前村民最近的食物、木材和石头，再按当前权重分配。
-        // 如果某一类资源当前不存在，选择函数会自动在其余资源中分配。
-        const int foodSN = findNearestResource(info, farmer, GATHER_FOOD);
+        int foodSN = findNearestResource(info, farmer, GATHER_FOOD);
+        if (foodSN == -1)
+            foodSN = findNearestFarm(info, farmer);
         const int woodSN = findNearestResource(info, farmer, GATHER_WOOD);
         const int stoneSN = findNearestResource(info, farmer, GATHER_STONE);
-        const GatherKind kind = chooseGatherKind(foodWorkers,
-                                                  woodWorkers,
-                                                  stoneWorkers,
-                                                  foodWeight,
-                                                  woodWeight,
-                                                  stoneWeight,
-                                                  foodSN != -1,
-                                                  woodSN != -1,
-                                                  stoneSN != -1);
+        const int goldSN = findNearestResource(info, farmer, GATHER_GOLD);
+
+        bool gatheringStone = false;
+        for (const tagResource &res : info.resources) {
+            if (farmer.WorkObjectSN == res.SN &&
+                resourceKind(res.Type) == GATHER_STONE) {
+                gatheringStone = true;
+                break;
+            }
+        }
+
+        // 食物见底时主动调回少量伐木工，避免所有造兵和补农民同时停摆。
+        if (info.Meat < 80 && foodWorkers < 6 && foodSN != -1) {
+            HumanAction(farmer.SN, foodSN);
+            ++foodWorkers;
+            continue;
+        }
+        if (!needStone && gatheringStone && (woodSN != -1 || foodSN != -1)) {
+            if (woodSN != -1) {
+                HumanAction(farmer.SN, woodSN);
+                ++woodWorkers;
+            } else {
+                HumanAction(farmer.SN, foodSN);
+                ++foodWorkers;
+            }
+            continue;
+        }
+
+        if (farmer.NowState != HUMAN_STATE_IDLE)
+            continue;
+
+        const GatherKind kind = chooseJob(foodWorkers, woodWorkers, stoneWorkers, goldWorkers,
+                                          foodWeight, woodWeight, stoneWeight, goldWeight,
+                                          foodSN != -1, woodSN != -1,
+                                          needStone && stoneSN != -1,
+                                          state.bronzeDone && goldSN != -1);
 
         int targetSN = -1;
         if (kind == GATHER_FOOD) {
@@ -528,10 +781,12 @@ void UsrAI::processData()
         } else if (kind == GATHER_STONE) {
             targetSN = stoneSN;
             ++stoneWorkers;
+        } else if (kind == GATHER_GOLD) {
+            targetSN = goldSN;
+            ++goldWorkers;
         }
 
         if (targetSN != -1)
             HumanAction(farmer.SN, targetSN);
     }
-
 }
